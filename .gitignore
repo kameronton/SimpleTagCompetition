@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# PyTorch
+*.pth
+*.pt
+models/
+checkpoints/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Results and logs
+results/
+logs/
+wandb/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Competition specific
+submissions/*/model_weights.*
+submissions/*/*.pth
+submissions/*/*.pt
+
+# Don't ignore the example submission template
+!submissions/example_team/
+
+# Docker
+.dockerignore

@@ -1,0 +1,229 @@
+name: Tournament Evaluation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'submissions/**'
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Check PR size limit
+      run: |
+        # Calculate total size of changed files
+        CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | grep "submissions/")
+        TOTAL_SIZE=0
+        
+        for file in $CHANGED_FILES; do
+          if [ -f "$file" ]; then
+            SIZE=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo 0)
+            TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+          fi
+        done
+        
+        MAX_SIZE=1048576  # 1 MB in bytes
+        echo "Total PR size: ${TOTAL_SIZE} bytes (limit: ${MAX_SIZE} bytes)"
+        
+        if [ $TOTAL_SIZE -gt $MAX_SIZE ]; then
+          echo "::error::PR size (${TOTAL_SIZE} bytes) exceeds limit of 1 MB. Please reduce the size of your submission."
+          exit 1
+        fi
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Extract team name and validate
+      id: team
+      run: |
+        # Extract team name from changed files in PR
+        TEAM_NAME=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | grep "submissions/" | cut -d'/' -f2 | head -n1)
+        
+        if [ -z "$TEAM_NAME" ]; then
+          echo "::error::No team name found in PR changes"
+          exit 1
+        fi
+        
+        echo "team_name=${TEAM_NAME}" >> $GITHUB_OUTPUT
+        echo "Evaluating team: ${TEAM_NAME}"
+    
+    - name: Create or update metadata.json
+      if: steps.team.outputs.team_name != ''
+      run: |
+        TEAM_NAME="${{ steps.team.outputs.team_name }}"
+        GITHUB_USER="${{ github.event.pull_request.user.login }}"
+        TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S")
+        METADATA_FILE="submissions/${TEAM_NAME}/metadata.json"
+        
+        # Create metadata.json
+        cat > "${METADATA_FILE}" << EOF
+        {
+          "github_id": "${GITHUB_USER}",
+          "timestamp": "${TIMESTAMP}",
+          "pr_number": ${{ github.event.pull_request.number }},
+          "commit_sha": "${{ github.sha }}"
+        }
+        EOF
+        
+        echo "Created metadata.json for ${TEAM_NAME}:"
+        cat "${METADATA_FILE}"
+    
+    - name: Check for existing submission and remove old one
+      if: steps.team.outputs.team_name != ''
+      run: |
+        TEAM_NAME="${{ steps.team.outputs.team_name }}"
+        GITHUB_USER="${{ github.event.pull_request.user.login }}"
+        
+        # Find all submissions from the same user
+        echo "Checking for existing submissions from ${GITHUB_USER}..."
+        
+        for dir in submissions/*/; do
+          if [ -d "$dir" ] && [ "$dir" != "submissions/${TEAM_NAME}/" ]; then
+            if [ -f "${dir}metadata.json" ]; then
+              EXISTING_USER=$(python3 -c "import json; print(json.load(open('${dir}metadata.json')).get('github_id', ''))" 2>/dev/null || echo "")
+              
+              if [ "$EXISTING_USER" = "$GITHUB_USER" ]; then
+                OLD_TEAM=$(basename "$dir")
+                echo "Found old submission from ${GITHUB_USER}: ${OLD_TEAM}"
+                echo "Removing old submission: ${dir}"
+                rm -rf "$dir"
+              fi
+            fi
+          fi
+        done
+    
+    - name: Run Local Test
+      if: steps.team.outputs.team_name != ''
+      run: |
+        python run_tournament.py \
+          --local-test \
+          --team "${{ steps.team.outputs.team_name }}" \
+          --num-episodes 50
+      continue-on-error: true
+    
+    - name: Run Round-Robin Tournament
+      run: |
+        python run_tournament.py \
+          --round-robin \
+          --num-episodes 50
+    
+    - name: Commit and push submission
+      if: steps.team.outputs.team_name != ''
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        
+        # Add all changes in submissions directory
+        git add submissions/
+        
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Update submission: ${{ steps.team.outputs.team_name }} by ${{ github.event.pull_request.user.login }}"
+          git push origin HEAD:main
+        fi
+    
+    - name: Upload results
+      uses: actions/upload-artifact@v3
+      with:
+        name: evaluation-results
+        path: results/
+    
+    - name: Comment PR with results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          // Read the latest local test results
+          const resultsDir = 'results';
+          const files = fs.readdirSync(resultsDir);
+          const teamName = '${{ steps.team.outputs.team_name }}';
+          
+          const localTestFile = files
+            .filter(f => f.startsWith(`local_test_${teamName}`))
+            .sort()
+            .reverse()[0];
+          
+          const roundRobinFile = files
+            .filter(f => f.startsWith('round_robin_'))
+            .sort()
+            .reverse()[0];
+          
+          let comment = '## Evaluation Results\n\n';
+          
+          // Local test results
+          if (localTestFile) {
+            comment += '### Local Test (Baseline Evaluation)\n\n';
+            const results = JSON.parse(fs.readFileSync(path.join(resultsDir, localTestFile), 'utf8'));
+            
+            for (const result of results) {
+              const role = result.role;
+              comment += `**${role.charAt(0).toUpperCase() + role.slice(1)}**:\n`;
+              
+              if (result.error) {
+                comment += `- ❌ Evaluation failed: ${result.error}\n`;
+              } else {
+                comment += `- Score: ${result.score.toFixed(2)}\n`;
+                comment += `- Avg Episode Length: ${result.avg_episode_length.toFixed(1)}\n`;
+                comment += `- Opponent: ${result.opponent}\n`;
+              }
+              comment += '\n';
+            }
+          }
+          
+          // Round-robin results
+          if (roundRobinFile) {
+            comment += '### Round-Robin Tournament Results\n\n';
+            const results = JSON.parse(fs.readFileSync(path.join(resultsDir, roundRobinFile), 'utf8'));
+            
+            if (results.leaderboard && results.leaderboard.length > 0) {
+              comment += '| Rank | Team | Avg Score | Prey Score | Predator Score | Matches |\n';
+              comment += '|------|------|-----------|------------|----------------|----------|\n';
+              
+              results.leaderboard.forEach((entry, idx) => {
+                const rank = idx + 1;
+                const team = entry.team;
+                const avgScore = entry.avg_score.toFixed(2);
+                const preyScore = entry.prey_score.toFixed(2);
+                const predatorScore = entry.predator_score.toFixed(2);
+                const matches = entry.matches;
+                
+                const highlight = team === teamName ? '**' : '';
+                comment += `| ${rank} | ${highlight}${team}${highlight} | ${avgScore} | ${preyScore} | ${predatorScore} | ${matches} |\n`;
+              });
+            }
+          }
+          
+          comment += '\n---\n';
+          comment += '*Your submission has been accepted and will be included in future tournaments.*\n';
+          comment += '*Only your latest submission will be kept in the leaderboard.*';
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
